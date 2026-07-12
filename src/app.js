@@ -14,13 +14,25 @@ const app = express();
 
 
 
+const allowedOrigins = [
+  process.env.FRONTEND_URL,
+  "https://task-management-frontend-ashy-zeta.vercel.app",
+  "http://localhost:4200",
+  "http://localhost:3000",
+].filter(Boolean);
+
 app.use(
   cors({
-  origin: [
-      
-      "https://task-management-frontend-ashy-zeta.vercel.app",
-      "http://localhost:4200",
-    ],
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      const cleanOrigin = origin.replace(/\/$/, "");
+      const isAllowed = allowedOrigins.some(allowed => allowed.replace(/\/$/, "") === cleanOrigin);
+      if (isAllowed || cleanOrigin.endsWith(".vercel.app") || cleanOrigin.includes("localhost")) {
+        callback(null, true);
+      } else {
+        callback(new Error(`Origin ${origin} not allowed by CORS`));
+      }
+    },
     credentials: true,
   })
 );
