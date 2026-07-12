@@ -1,5 +1,10 @@
 const Task = require("../models/Task");
 const User = require("../models/User");
+const {
+  checkTaskVisibility,
+  emitTaskEvent,
+  emitTaskDeleteEvent,
+} = require("../utils/taskHelper");
 
 const canAssignTask = (currentUser, assignee) => {
   if (currentUser._id.toString() === assignee._id.toString()) {
@@ -40,7 +45,7 @@ module.exports = (io, socket) => {
         createdBy: currentUser._id, assignedBy: currentUser._id, assignedTo: assigneeId,
       });
 
-      io.emit("task:created", task);
+      await emitTaskEvent("task:created", task);
       callback({ success: true, message: "Task created successfully.", data: task });
     } catch (error) {
       callback({ success: false, message: error.message });
@@ -53,17 +58,13 @@ module.exports = (io, socket) => {
       const { id, title, description, status, assignedTo } = data;
       const currentUser = socket.user;
       
-      const task = await Task.findById(id).populate("assignedTo", "role");
+      const task = await Task.findById(id)
+        .populate("assignedTo", "role")
+        .populate("createdBy", "role");
       if (!task) return callback({ success: false, message: "Task not found" });
 
-      if (currentUser.role === "Employee") {
-        if (task.assignedTo._id.toString() !== currentUser._id.toString()) {
-          return callback({ success: false, message: "You can update only your own tasks." });
-        }
-      } else if (currentUser.role === "TeamLead") {
-        if (task.assignedTo._id.toString() !== currentUser._id.toString() && task.assignedTo.role !== "Employee") {
-          return callback({ success: false, message: "You are not allowed to update this task." });
-        }
+      if (!checkTaskVisibility(task, currentUser)) {
+        return callback({ success: false, message: "You are not authorized to update this task." });
       }
 
       if (title !== undefined) task.title = title;
@@ -80,7 +81,7 @@ module.exports = (io, socket) => {
       }
 
       await task.save();
-      io.emit("task:updated", task);
+      await emitTaskEvent("task:updated", task);
       callback({ success: true, message: "Task updated successfully.", data: task });
     } catch (error) {
       callback({ success: false, message: error.message });
@@ -93,23 +94,19 @@ module.exports = (io, socket) => {
       const { id } = data;
       const currentUser = socket.user;
       
-      const task = await Task.findById(id).populate("assignedTo", "role");
+      const task = await Task.findById(id)
+        .populate("assignedTo", "role")
+        .populate("createdBy", "role");
       if (!task) return callback({ success: false, message: "Task not found" });
 
-      if (currentUser.role === "Employee") {
-        if (task.assignedTo._id.toString() !== currentUser._id.toString()) {
-          return callback({ success: false, message: "You can delete only your own tasks." });
-        }
-      } else if (currentUser.role === "TeamLead") {
-        if (task.assignedTo._id.toString() !== currentUser._id.toString() && task.assignedTo.role !== "Employee") {
-          return callback({ success: false, message: "You are not authorized to delete this task." });
-        }
+      if (!checkTaskVisibility(task, currentUser)) {
+        return callback({ success: false, message: "You are not authorized to delete this task." });
       }
 
-      const taskId = task._id;
+      await emitTaskDeleteEvent(task);
+
       await task.deleteOne();
       
-      io.emit("task:deleted", { _id: taskId });
       callback({ success: true, message: "Task deleted successfully." });
     } catch (error) {
       callback({ success: false, message: error.message });
@@ -124,8 +121,14 @@ module.exports = (io, socket) => {
       
       if (!assignedTo) return callback({ success: false, message: "assignedTo is required." });
 
-      const task = await Task.findById(id);
+      const task = await Task.findById(id)
+        .populate("assignedTo", "role")
+        .populate("createdBy", "role");
       if (!task) return callback({ success: false, message: "Task not found." });
+
+      if (!checkTaskVisibility(task, currentUser)) {
+        return callback({ success: false, message: "You are not authorized to assign this task." });
+      }
 
       const assignee = await User.findById(assignedTo);
       if (!assignee) return callback({ success: false, message: "Assigned user not found." });
@@ -142,7 +145,7 @@ module.exports = (io, socket) => {
       task.assignedBy = currentUser._id;
       await task.save();
 
-      io.emit("task:assigned", task);
+      await emitTaskEvent("task:assigned", task);
       callback({ success: true, message: "Task assigned successfully.", data: task });
     } catch (error) {
       callback({ success: false, message: error.message });
@@ -159,23 +162,19 @@ module.exports = (io, socket) => {
         return callback({ success: false, message: "Status must be Pending or Completed." });
       }
 
-      const task = await Task.findById(id).populate("assignedTo", "role");
+      const task = await Task.findById(id)
+        .populate("assignedTo", "role")
+        .populate("createdBy", "role");
       if (!task) return callback({ success: false, message: "Task not found." });
 
-      if (currentUser.role === "Employee") {
-        if (task.assignedTo._id.toString() !== currentUser._id.toString()) {
-          return callback({ success: false, message: "You can update only your own tasks." });
-        }
-      } else if (currentUser.role === "TeamLead") {
-        if (task.assignedTo._id.toString() !== currentUser._id.toString() && task.assignedTo.role !== "Employee") {
-          return callback({ success: false, message: "You are not allowed to update this task." });
-        }
+      if (!checkTaskVisibility(task, currentUser)) {
+        return callback({ success: false, message: "You are not allowed to update this task." });
       }
 
       task.status = status;
       await task.save();
 
-      io.emit("task:statusChanged", task);
+      await emitTaskEvent("task:statusChanged", task);
       callback({ success: true, message: "Task status updated successfully.", data: task });
     } catch (error) {
       callback({ success: false, message: error.message });
@@ -211,11 +210,13 @@ module.exports = (io, socket) => {
         query.status = status;
       }
 
-      const tasks = await Task.find(query)
+      let tasks = await Task.find(query)
         .populate("createdBy", "username email role")
         .populate("assignedBy", "username email role")
         .populate("assignedTo", "username email role")
         .sort({ createdAt: -1 });
+
+      tasks = tasks.filter(task => checkTaskVisibility(task, currentUser));
 
       callback({ success: true, count: tasks.length, data: tasks });
     } catch (error) {
@@ -236,14 +237,8 @@ module.exports = (io, socket) => {
 
       if (!task) return callback({ success: false, message: "Task not found." });
 
-      if (currentUser.role === "Employee") {
-        if (task.assignedTo._id.toString() !== currentUser._id.toString()) {
-          return callback({ success: false, message: "You are not authorized to view this task." });
-        }
-      } else if (currentUser.role === "TeamLead") {
-        if (task.assignedTo._id.toString() !== currentUser._id.toString() && task.assignedTo.role !== "Employee") {
-          return callback({ success: false, message: "You are not authorized to view this task." });
-        }
+      if (!checkTaskVisibility(task, currentUser)) {
+        return callback({ success: false, message: "You are not authorized to view this task." });
       }
 
       callback({ success: true, data: task });

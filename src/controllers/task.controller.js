@@ -2,6 +2,11 @@
 const Task = require("../models/Task");
 const User = require("../models/User");
 const { getIO } = require("../socket");
+const {
+  checkTaskVisibility,
+  emitTaskEvent,
+  emitTaskDeleteEvent
+} = require("../utils/taskHelper");
 
 const canAssignTask = (currentUser, assignee) => {
   if (currentUser._id.toString() === assignee._id.toString()) {
@@ -27,7 +32,7 @@ exports.createTask = async (req, res) => {
 
     let assigneeId = currentUser._id;
 
-   
+
     if (assignedTo) {
       const assignee = await User.findById(assignedTo);
 
@@ -60,7 +65,7 @@ exports.createTask = async (req, res) => {
       assignedTo: assigneeId,
     });
 
-    getIO().emit("task:created", task);
+    await emitTaskEvent("task:created", task);
 
     return res.status(201).json({
       success: true,
@@ -109,7 +114,7 @@ exports.getTasks = async (req, res) => {
       ];
     }
 
-   
+
     else if (currentUser.role === "Manager") {
       const users = await User.find({
         role: {
@@ -137,13 +142,15 @@ exports.getTasks = async (req, res) => {
       query.status = status;
     }
 
-    const tasks = await Task.find(query)
+    let tasks = await Task.find(query)
       .populate("createdBy", "username email role")
       .populate("assignedBy", "username email role")
       .populate("assignedTo", "username email role")
       .sort({
         createdAt: -1,
       });
+
+    tasks = tasks.filter(task => checkTaskVisibility(task, currentUser));
 
     return res.status(200).json({
       success: true,
@@ -166,10 +173,9 @@ exports.updateTask = async (req, res) => {
 
     const currentUser = req.user;
 
-    const task = await Task.findById(req.params.id).populate(
-      "assignedTo",
-      "role"
-    );
+    const task = await Task.findById(req.params.id)
+      .populate("assignedTo", "role")
+      .populate("createdBy", "role");
 
     if (!task) {
       return res.status(404).json({
@@ -178,45 +184,19 @@ exports.updateTask = async (req, res) => {
       });
     }
 
-
-
-    if (currentUser.role === "Employee") {
-      if (task.assignedTo._id.toString() !== currentUser._id.toString()) {
-        return res.status(403).json({
-          success: false,
-          message: "You can update only your own tasks.",
-        });
-      }
+    if (!checkTaskVisibility(task, currentUser)) {
+      return res.status(403).json({
+        success: false,
+        message: "You are not authorized to update this task.",
+      });
     }
-
-    else if (currentUser.role === "TeamLead") {
-
-   
-      if (task.assignedTo._id.toString() === currentUser._id.toString()) {
-      
-      }
-
-    
-      else if (task.assignedTo.role === "Employee") {
-       
-      }
-
-      else {
-        return res.status(403).json({
-          success: false,
-          message: "You are not allowed to update this task.",
-        });
-      }
-    }
-
-  
 
     if (title !== undefined) task.title = title;
 
     if (description !== undefined) task.description = description;
 
     if (status !== undefined) task.status = status;
-    
+
     if (assignedTo && assignedTo !== task.assignedTo._id.toString()) {
       const assignee = await User.findById(assignedTo);
       if (!assignee) {
@@ -230,7 +210,7 @@ exports.updateTask = async (req, res) => {
 
     await task.save();
 
-    getIO().emit("task:updated", task);
+    await emitTaskEvent("task:updated", task);
 
     return res.status(200).json({
       success: true,
@@ -254,10 +234,9 @@ exports.deleteTask = async (req, res) => {
   try {
     const currentUser = req.user;
 
-    const task = await Task.findById(req.params.id).populate(
-      "assignedTo",
-      "role"
-    );
+    const task = await Task.findById(req.params.id)
+      .populate("assignedTo", "role")
+      .populate("createdBy", "role");
 
     if (!task) {
       return res.status(404).json({
@@ -266,43 +245,18 @@ exports.deleteTask = async (req, res) => {
       });
     }
 
-
-
-    if (currentUser.role === "Employee") {
-      if (task.assignedTo._id.toString() !== currentUser._id.toString()) {
-        return res.status(403).json({
-          success: false,
-          message: "You can delete only your own tasks.",
-        });
-      }
+    if (!checkTaskVisibility(task, currentUser)) {
+      return res.status(403).json({
+        success: false,
+        message: "You are not authorized to delete this task.",
+      });
     }
-
-    else if (currentUser.role === "TeamLead") {
-
-      if (task.assignedTo._id.toString() === currentUser._id.toString()) {
-        
-      }
-
-     
-      else if (task.assignedTo.role === "Employee") {
-       
-      }
-
-   
-      else {
-        return res.status(403).json({
-          success: false,
-          message: "You are not authorized to delete this task.",
-        });
-      }
-    }
-
 
     const taskId = task._id;
 
-    await task.deleteOne();
+    await emitTaskDeleteEvent(task);
 
-    getIO().emit("task:deleted", { _id: taskId });
+    await task.deleteOne();
 
     return res.status(200).json({
       success: true,
@@ -334,12 +288,21 @@ exports.assignTask = async (req, res) => {
       });
     }
 
-    const task = await Task.findById(req.params.id);
+    const task = await Task.findById(req.params.id)
+      .populate("assignedTo", "role")
+      .populate("createdBy", "role");
 
     if (!task) {
       return res.status(404).json({
         success: false,
         message: "Task not found.",
+      });
+    }
+
+    if (!checkTaskVisibility(task, currentUser)) {
+      return res.status(403).json({
+        success: false,
+        message: "You are not authorized to assign this task.",
       });
     }
 
@@ -365,7 +328,7 @@ exports.assignTask = async (req, res) => {
 
     await task.save();
 
-    getIO().emit("task:assigned", task);
+    await emitTaskEvent("task:assigned", task);
 
     return res.status(200).json({
       success: true,
@@ -398,10 +361,9 @@ exports.updateTaskStatus = async (req, res) => {
       });
     }
 
-    const task = await Task.findById(req.params.id).populate(
-      "assignedTo",
-      "role"
-    );
+    const task = await Task.findById(req.params.id)
+      .populate("assignedTo", "role")
+      .populate("createdBy", "role");
 
     if (!task) {
       return res.status(404).json({
@@ -410,36 +372,18 @@ exports.updateTaskStatus = async (req, res) => {
       });
     }
 
-
-    if (currentUser.role === "Employee") {
-      if (task.assignedTo._id.toString() !== currentUser._id.toString()) {
-        return res.status(403).json({
-          success: false,
-          message: "You are not allowed to update this task.",
-        });
-      }
+    if (!checkTaskVisibility(task, currentUser)) {
+      return res.status(403).json({
+        success: false,
+        message: "You are not allowed to update this task.",
+      });
     }
-
-   
-    else if (currentUser.role === "TeamLead") {
-      if (
-        task.assignedTo._id.toString() !== currentUser._id.toString() &&
-        task.assignedTo.role !== "Employee"
-      ) {
-        return res.status(403).json({
-          success: false,
-          message: "You are not allowed to update this task.",
-        });
-      }
-    }
-
-
 
     task.status = status;
 
     await task.save();
 
-    getIO().emit("task:statusChanged", task);
+    await emitTaskEvent("task:statusChanged", task);
 
     return res.status(200).json({
       success: true,
@@ -474,55 +418,14 @@ exports.getTaskById = async (req, res) => {
         message: "Task not found.",
       });
     }
-
-
-
-    if (currentUser.role === "Employee") {
-
-      if (
-        task.assignedTo._id.toString() !==
-        currentUser._id.toString()
-      ) {
-
-        return res.status(403).json({
-          success: false,
-          message: "You are not authorized to view this task.",
-        });
-
-      }
-
+    if (!checkTaskVisibility(task, currentUser)) {
+      return res.status(403).json({
+        success: false,
+        message: "You are not authorized to view this task.",
+      });
     }
 
- 
 
-    else if (currentUser.role === "TeamLead") {
-
-      if (
-        task.assignedTo._id.toString() ===
-        currentUser._id.toString()
-      ) {
-
-      }
-
-      else if (
-        task.assignedTo.role === "Employee"
-      ) {
-
-       
-      }
-
-      else {
-
-        return res.status(403).json({
-          success: false,
-          message: "You are not authorized to view this task.",
-        });
-
-      }
-
-    }
-
- 
 
     return res.status(200).json({
       success: true,
